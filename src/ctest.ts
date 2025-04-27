@@ -219,10 +219,19 @@ class CTestOutputLogger implements OutputConsumer {
     }
 }
 
-// A test item and its parent test suite item in the test explorer
-interface TestAndParentSuite {
-    test: vscode.TestItem;
-    parentSuite: vscode.TestItem;
+// Intermediate test configuration
+// - required because the uri property of vscode.TestItem is read-only, but it might happen
+//   that it needs to be updated
+class InternalTestItem {
+    public name: string;
+    public uri: vscode.Uri | undefined = undefined;
+    public range: vscode.Range | undefined = undefined;
+    public tags: vscode.TestTag[] = [];
+    public children: Map<string, InternalTestItem> = new Map<string, InternalTestItem>();
+
+    constructor(name: string) {
+        this.name = name;
+    }
 }
 
 export class CTestDriver implements vscode.Disposable {
@@ -690,28 +699,16 @@ export class CTestDriver implements vscode.Disposable {
         return undefined;
     }
 
-    private createTestItemAndSuiteTree(testName: string, testExplorerRoot: vscode.TestItem, initializedTestExplorer: vscode.TestController, uri?: vscode.Uri): TestAndParentSuite {
-        let parentSuiteItem = testExplorerRoot;
-        let testLabel = testName;
+    private addTests(testItems: Map<string, InternalTestItem>, parentItem: vscode.TestItem, initializedTestExplorer: vscode.TestController) {      
+        testItems.forEach((testItem: InternalTestItem, label: string) => {
+            const newTestItem = initializedTestExplorer.createTestItem(testItem.name, label, testItem.uri);
+            newTestItem.tags = testItem.tags;
+            newTestItem.range = testItem.range;
 
-        // If a suite delimiter is set, create a suite tree
-        if (this.ws.config.testSuiteDelimiter) {
-            const delimiterRegExp = new RegExp(this.ws.config.testSuiteDelimiter);
-            const parts = testName.split(delimiterRegExp);
-            testLabel = parts.pop() || testName; // The last part is the test label
+            parentItem.children.add(newTestItem);
 
-            // Create a suite item for each suite ID part if it doesn't exist yet at that tree level
-            for (const suiteId of parts) {
-                let suiteItem = parentSuiteItem.children.get(suiteId);
-                if (!suiteItem) {
-                    suiteItem = initializedTestExplorer.createTestItem(suiteId, suiteId);
-                    parentSuiteItem.children.add(suiteItem);
-                }
-                parentSuiteItem = suiteItem;
-            }
-        }
-        const testItem = initializedTestExplorer.createTestItem(testName, testLabel, uri);
-        return { test: testItem, parentSuite: parentSuiteItem };
+            this.addTests(testItem.children, newTestItem, initializedTestExplorer);
+        });
     }
 
     /**
@@ -795,6 +792,8 @@ export class CTestDriver implements vscode.Disposable {
             }
 
             if (this.tests && this.tests.kind === 'ctestInfo') {
+                const rootTestItem = new InternalTestItem("root");
+
                 this.tests.tests.forEach(test => {
                     let testDefFile: string | undefined;
                     let testDefLine: number | undefined;
@@ -822,9 +821,26 @@ export class CTestDriver implements vscode.Disposable {
                         testDefLine = this.tests!.backtraceGraph.nodes[test.backtrace].line;
                     }
 
-                    const testAndParentSuite = this.createTestItemAndSuiteTree(test.name, testExplorerRoot, initializedTestExplorer, testDefFile ? vscode.Uri.file(testDefFile) : undefined);
-                    const testItem = testAndParentSuite.test;
-                    const parentSuiteItem = testAndParentSuite.parentSuite;
+                    // If a suite delimiter is set, create a suite tree
+                    let parts: string[] = [test.name];
+                    if (this.ws.config.testSuiteDelimiter) {
+                        const delimiterRegExp = new RegExp(this.ws.config.testSuiteDelimiter);
+                        parts = test.name.split(delimiterRegExp);
+                    }
+
+                    let testItem = rootTestItem;
+                    let testItemName = "";
+                    for (const testPart of parts) {
+                        testItemName += testPart;
+                        if (!testItem.children.has(testPart)) {
+                            testItem.children.set(testPart, new InternalTestItem(testItemName));
+                        }
+                        testItem = testItem.children.get(testPart)!;
+                        testItemName += this.ws.config.testSuiteDelimiter;
+                    }
+
+                    testItem.name = test.name;
+                    testItem.uri = testDefFile ? vscode.Uri.file(testDefFile) : undefined;
 
                     if (testDefLine !== undefined) {
                         testItem.range = new vscode.Range(new vscode.Position(testDefLine - 1, 0), new vscode.Position(testDefLine - 1, 0));
@@ -846,9 +862,9 @@ export class CTestDriver implements vscode.Disposable {
                     if (testTags.length !== 0) {
                         testItem.tags = [...testItem.tags, ...testTags];
                     }
-
-                    parentSuiteItem.children.add(testItem);
                 });
+
+                this.addTests(rootTestItem.children, testExplorerRoot, initializedTestExplorer);
             };
         }
 
